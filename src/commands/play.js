@@ -1,5 +1,5 @@
-import { SlashCommandBuilder } from "discord.js";
-import ServerQueue from "../utils/queue.js"; 
+import { SlashCommandBuilder, MessageFlags } from "discord.js";
+import ServerQueue, { queues } from "../utils/queue.js"; 
 import { spawn } from "child_process";
 
 export const data = new SlashCommandBuilder()
@@ -19,7 +19,6 @@ export async function execute(interaction) {
     const url = interaction.options.getString("url");
     const channel = interaction.member.voice.channel;
     const guildId = interaction.guildId;
-    const queueMap = interaction.client.queue; 
 
     if (!channel) {
         return interaction.editReply("❌ Bạn cần vào voice channel trước!");
@@ -34,16 +33,20 @@ export async function execute(interaction) {
         await interaction.editReply("⏳ Đang lấy thông tin video...");
         
         const infoProcess = spawn(ytdlpPath, [
+            '--encoding', 'utf-8',
             '--get-title',
             '--no-warnings',
+            '--no-playlist',
             url
         ]);
 
         let title = url;
         let infoError = null;
-        
+        const titleChunks = [];
+
+        // Collect raw bytes and decode once, so multi-byte chars split across chunks stay intact
         infoProcess.stdout.on('data', (data) => {
-            title = data.toString().trim();
+            titleChunks.push(data);
         });
 
         infoProcess.on('error', (error) => {
@@ -58,6 +61,9 @@ export async function execute(interaction) {
         if (infoError) {
              return interaction.editReply(`❌ Lỗi khi lấy thông tin video: ${infoError.message}`);
         }
+
+        const decodedTitle = new TextDecoder('utf-8').decode(Buffer.concat(titleChunks)).trim();
+        if (decodedTitle) title = decodedTitle;
         
         const song = {
             title: title,
@@ -66,11 +72,11 @@ export async function execute(interaction) {
         };
 
         // 2. Quản lý hàng đợi
-        let serverQueue = queueMap.get(guildId);
+        let serverQueue = queues.get(guildId);
 
         if (!serverQueue) {
             serverQueue = new ServerQueue(guildId, interaction);
-            queueMap.set(guildId, serverQueue);
+            queues.set(guildId, serverQueue);
             serverQueue.songs.push(song);
             
             await interaction.editReply(`🎶 Đã thêm **${song.title}** vào hàng đợi. Bắt đầu phát...`);
@@ -88,7 +94,7 @@ export async function execute(interaction) {
         if (interaction.deferred) {
             await interaction.editReply(errorMessage);
         } else {
-            await interaction.reply({ content: errorMessage, ephemeral: true });
+            await interaction.reply({ content: errorMessage, flags: MessageFlags.Ephemeral });
         }
     }
 }

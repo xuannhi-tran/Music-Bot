@@ -12,7 +12,8 @@ import { spawn } from "child_process";
 const ytdlpPath = process.env.YTDLP_PATH || './yt-dlp.exe';
 const ffmpegPath = process.env.FFMPEG_PATH || './ffmpeg.exe';
 
-global.queueMap = global.queueMap || new Map(); 
+// Nguồn duy nhất lưu hàng đợi theo guildId
+export const queues = new Map();
 
 class ServerQueue {
     constructor(guildId, interaction) {
@@ -25,9 +26,12 @@ class ServerQueue {
         this.playing = false;
         this.loop = false;
         
-        this.currentYtDlp = null;
-        this.currentFFmpeg = null;
-        
+        // Phiên phát hiện tại: { ytdlp, ffmpeg, resource, stopping }
+        this.session = null;
+        this.stopped = false;
+        // Resource đã bị chủ động dọn dẹp: lỗi 'Premature close' của chúng là dự kiến
+        this.teardownResources = new WeakSet();
+
         // Listener cho Player
         this.player.on(AudioPlayerStatus.Idle, () => {
             console.log(`[${this.guildId}] Player Status: Idle. Trying next song.`);
@@ -48,7 +52,7 @@ class ServerQueue {
                     // PHÒNG VỆ: Kiểm tra kết nối trước khi destroy
                     if (this.connection && this.connection.state.status !== VoiceConnectionStatus.Destroyed && this.songs.length === 0) {
                         this.textChannel.send('🎶 Hàng đợi trống. Đã rời kênh voice.');
-                        global.queueMap.delete(this.guildId);
+                        this.unregister();
                         this.connection.destroy();
                         this.connection = null; // Rất quan trọng: Thiết lập null sau khi destroy thành công
                     }
@@ -57,11 +61,15 @@ class ServerQueue {
         });
         
         this.player.on('error', error => {
+            if (error.resource && this.teardownResources.has(error.resource)) {
+                // Lỗi do chính mình đóng stream khi skip/stop; player sẽ tự về Idle ngay sau đó
+                return;
+            }
             console.error(`[${this.guildId}] Player Error:`, error);
             this.textChannel.send(`❌ Có lỗi khi phát nhạc: \`${error.message}\`. Bỏ qua bài hát.`);
-            if (this.player.state.status !== AudioPlayerStatus.Idle) {
-                 setImmediate(() => this.skip());
-            }
+            // @discordjs/voice chuyển player sang Idle ngay sau sự kiện 'error' này,
+            // handler Idle ở trên sẽ tự chuyển bài; ở đây chỉ cần dọn tiến trình.
+            this.cleanupProcesses();
         });
 
         this.connection?.on(VoiceConnectionStatus.Disconnected, () => {
@@ -70,25 +78,59 @@ class ServerQueue {
                 this.connection.destroy();
              }
              this.connection = null;
-             global.queueMap.delete(this.guildId);
+             this.unregister();
              this.textChannel.send('❌ Đã mất kết nối Voice Channel.');
         });
     }
 
+    /** Gỡ hàng đợi này khỏi Map (chỉ khi Map vẫn đang trỏ tới chính nó). */
+    unregister() {
+        if (queues.get(this.guildId) === this) queues.delete(this.guildId);
+    }
+
     /**
-     * @returns {void} Dọn dẹp và giết các tiến trình con.
+     * Dọn dẹp phiên phát hiện tại. An toàn khi gọi nhiều lần (idempotent):
+     * đặt cờ stopping -> unpipe -> destroy stream -> kill yt-dlp -> kill ffmpeg.
+     * @returns {void}
      */
     cleanupProcesses() {
-        if (this.currentFFmpeg) {
-            console.log(`[${this.guildId}] Killing ffmpeg process...`);
-            this.currentFFmpeg.kill('SIGKILL'); 
-            this.currentFFmpeg = null;
-        }
-        if (this.currentYtDlp) {
-            console.log(`[${this.guildId}] Killing yt-dlp process...`);
-            this.currentYtDlp.kill('SIGKILL'); 
-            this.currentYtDlp = null;
-        }
+        const session = this.session;
+        if (!session || session.stopping) return;
+        session.stopping = true;
+        this.session = null;
+        if (session.resource) this.teardownResources.add(session.resource);
+
+        const { ytdlp, ffmpeg } = session;
+        const safe = (fn) => { try { fn(); } catch (err) { this.logStreamError('cleanup', session, err); } };
+
+        safe(() => ytdlp.stdout?.unpipe(ffmpeg.stdin));
+        safe(() => ffmpeg.stdin?.destroy());
+        safe(() => ytdlp.stdout?.destroy());
+        safe(() => ytdlp.stderr?.destroy());
+        safe(() => ffmpeg.stdout?.destroy());
+
+        console.log(`[${this.guildId}] Killing yt-dlp process...`);
+        safe(() => ytdlp.kill('SIGKILL'));
+        console.log(`[${this.guildId}] Killing ffmpeg process...`);
+        safe(() => ffmpeg.kill('SIGKILL'));
+    }
+
+    /**
+     * Ghi log lỗi stream; bỏ qua EPIPE / ERR_STREAM_DESTROYED khi đang teardown.
+     */
+    logStreamError(name, session, err) {
+        if (session.stopping && (err?.code === 'EPIPE' || err?.code === 'ERR_STREAM_DESTROYED')) return;
+        console.error(`[${this.guildId}] ${name} error:`, err);
+    }
+
+    /**
+     * Xử lý lỗi của tiến trình phát: chỉ thực hiện nếu phiên còn hiệu lực,
+     * rồi đi qua skip() (cùng đường với /skip) để chuyển bài hoặc rời kênh.
+     */
+    failSession(session, message) {
+        if (session.stopping || this.session !== session) return;
+        this.textChannel.send(message);
+        this.skip();
     }
 
     async joinChannel() {
@@ -110,7 +152,7 @@ class ServerQueue {
             console.error(`[${this.guildId}] Lỗi Timeout khi kết nối:`, err);
             this.connection.destroy();
             this.connection = null; // Thiết lập null nếu destroy do lỗi
-            global.queueMap.delete(this.guildId);
+            this.unregister();
             throw new Error("Không thể kết nối voice channel.");
         }
     }
@@ -131,6 +173,7 @@ class ServerQueue {
             '-f', 'bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio', 
             '-o', '-',
             '--no-warnings',
+            '--no-playlist',
             song.url
         ];
         const ytdlpProcess = spawn(ytdlpPath, ytdlpArgs);
@@ -150,10 +193,18 @@ class ServerQueue {
         
         const ffmpegProcess = spawn(ffmpegPath, ffmpegArgs);
         
-        this.currentYtDlp = ytdlpProcess;
-        this.currentFFmpeg = ffmpegProcess;
+        const session = { ytdlp: ytdlpProcess, ffmpeg: ffmpegProcess, stopping: false };
+        this.session = session;
+
+        // Handler 'error' cho mọi stream để EPIPE khi teardown không làm crash process
+        const watch = (name, stream) => stream?.on('error', (err) => this.logStreamError(name, session, err));
+        watch('ffmpeg.stdin', ffmpegProcess.stdin);
+        watch('ffmpeg.stdout', ffmpegProcess.stdout);
+        watch('ytdlp.stdout', ytdlpProcess.stdout);
+        watch('ytdlp.stderr', ytdlpProcess.stderr);
         
         ytdlpProcess.once('spawn', () => {
+             if (session.stopping) return;
              console.log(`[${this.guildId}] yt-dlp spawned. Piping to FFmpeg.`);
              ytdlpProcess.stdout.pipe(ffmpegProcess.stdin);
         });
@@ -162,35 +213,32 @@ class ServerQueue {
             inputType: StreamType.Raw,
         });
         
+        session.resource = resource;
         this.player.play(resource);
         this.textChannel.send(`🎵 Đang phát: **${song.title}** (Yêu cầu bởi ${song.requester})`);
 
         // Xử lý lỗi tiến trình
         ytdlpProcess.on('error', (error) => {
             console.error('❌ yt-dlp process error:', error);
-            this.textChannel.send('❌ Lỗi yt-dlp khi khởi động. Bỏ qua bài hát.');
-            this.skip();
+            this.failSession(session, '❌ Lỗi yt-dlp khi khởi động. Bỏ qua bài hát.');
         });
         ffmpegProcess.on('error', (error) => {
             console.error('❌ ffmpeg process error:', error);
-            this.textChannel.send('❌ Lỗi ffmpeg khi khởi động. Bỏ qua bài hát.');
-            this.skip();
+            this.failSession(session, '❌ Lỗi ffmpeg khi khởi động. Bỏ qua bài hát.');
         });
         
         ytdlpProcess.on('close', (code) => {
+            if (session.stopping) return;
             if (code !== 0 && code !== null) { 
                 console.error(`❌ yt-dlp process exited with code ${code}. Download stream failed.`);
-                this.textChannel.send(`❌ Lỗi tải stream (${code}). Bỏ qua bài hát.`);
-                this.skip();
+                this.failSession(session, `❌ Lỗi tải stream (${code}). Bỏ qua bài hát.`);
             }
-            this.currentYtDlp = null; 
         });
 
         ffmpegProcess.on('close', (code) => {
-             if (code !== 0 && code !== null) { 
+             if (!session.stopping && code !== 0 && code !== null) { 
                 console.error(`❌ ffmpeg process exited with code ${code}. Piping failed.`);
              }
-             this.currentFFmpeg = null;
         });
     }
 
@@ -200,24 +248,21 @@ class ServerQueue {
      */
     skip() {
         if (this.songs.length > 0) {
+            // player.stop() phát Idle đồng bộ -> handler Idle shift bài + dọn tiến trình
             this.player.stop(); 
-            
-            setImmediate(() => {
-                this.cleanupProcesses();
-            });
-            
+            // Phòng khi player đã Idle sẵn (không có sự kiện): dọn đồng bộ, idempotent
+            this.cleanupProcesses();
             return true;
         } 
         return false;
     }
 
     stop() {
+        if (this.stopped) return;
+        this.stopped = true;
         this.songs = [];
         this.player.stop();
-        
-        setImmediate(() => {
-            this.cleanupProcesses();
-        });
+        this.cleanupProcesses();
         
         // SỬA LỖI: Kiểm tra trạng thái và thiết lập null để ngăn chặn double-destroy
         if (this.connection && this.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -225,11 +270,32 @@ class ServerQueue {
             this.connection = null; 
         }
         
-        global.queueMap.delete(this.guildId);
+        this.unregister();
         this.textChannel.send('⏹️ Đã dừng và xóa hàng đợi.');
     }
 
-    // ... (pause() và resume() giữ nguyên)
+    /**
+     * Tạm dừng AudioPlayer.
+     * @returns {boolean} True nếu đã tạm dừng, False nếu không có nhạc đang phát hoặc đã tạm dừng sẵn.
+     */
+    pause() {
+        if (this.player.state.status !== AudioPlayerStatus.Playing) return false;
+        return this.player.pause();
+    }
+
+    /**
+     * Tiếp tục phát AudioPlayer.
+     * @returns {boolean} True nếu đã tiếp tục, False nếu nhạc không ở trạng thái tạm dừng.
+     */
+    resume() {
+        if (this.player.state.status !== AudioPlayerStatus.Paused &&
+            this.player.state.status !== AudioPlayerStatus.AutoPaused) return false;
+        return this.player.unpause();
+    }
+
+    get isPaused() {
+        return this.player.state.status === AudioPlayerStatus.Paused;
+    }
 }
 
 export default ServerQueue;
