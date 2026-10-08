@@ -76,3 +76,4 @@ src/
 
 - It only supports YouTube links, not search terms or other sites.
 - Built for personal use on a small private server.
+- If playback suddenly fails, update yt-dlp first, since YouTube changes often.
